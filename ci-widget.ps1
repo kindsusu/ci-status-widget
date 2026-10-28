@@ -282,7 +282,7 @@ $miniBar.Add_Paint({
         $n = $script:summary[$chip[0]]
         $tone = if ($n) { $T[$chip[0]] } else { $T.muted }
         $cy = [int](($h - 10) / 2)
-        if ($chip[2]) { $p = New-Object Drawing.Pen($tone, 1.8); $g.DrawEllipse($p, $x, $cy, 10, 10); $p.Dispose() }
+        if ($chip[2] -or -not $n) { $p = New-Object Drawing.Pen($tone, 1.8); $g.DrawEllipse($p, $x, $cy, 10, 10); $p.Dispose() }
         else { $b = New-Object Drawing.SolidBrush($tone); $g.FillEllipse($b, $x, $cy, 10, 10); $b.Dispose() }
         $text = "$($chip[1]) $n"
         [Windows.Forms.TextRenderer]::DrawText($g, $text, $fontBold, (New-Object Drawing.Rectangle(($x + 16), 0, 120, $h)), $(if ($n) { $T.fg } else { $T.muted }), $flags)
@@ -571,7 +571,7 @@ function Draw-Strip([Drawing.Graphics]$g, [int]$w, [int]$h, [switch]$Solid) {
     foreach ($chip in @(('running', '실행 중', $false), ('queued', '대기', $true))) {
         $n = $script:summary[$chip[0]]
         $tone = if ($n) { $tones[$chip[0]] } else { $zero }
-        if ($chip[2]) { $pen = New-Object Drawing.Pen($tone, 1.8); $g.DrawEllipse($pen, 33, ($y + 4), 9, 9); $pen.Dispose() }
+        if ($chip[2] -or -not $n) { $pen = New-Object Drawing.Pen($tone, 1.8); $g.DrawEllipse($pen, 33, ($y + 4), 9, 9); $pen.Dispose() }
         else { $b = New-Object Drawing.SolidBrush($tone); $g.FillEllipse($b, 33, ($y + 4), 10, 10); $b.Dispose() }
         $b = New-Object Drawing.SolidBrush($(if ($n) { $fg } else { $dim }))
         $g.DrawString("$($chip[1]) $n", $fontStrip, $b, (New-Object Drawing.RectangleF(45, $y, ($w - 46), 18)), $sf); $b.Dispose()
