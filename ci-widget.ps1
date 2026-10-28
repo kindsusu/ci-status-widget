@@ -55,7 +55,10 @@ $DoneCount = 20
 
 # 두 번 띄우면 조회만 두 배가 되므로 하나만 둔다
 $mutex = New-Object Threading.Mutex($false, 'Local\CiStatusWidget')
-if (-not $Snapshot -and -not $mutex.WaitOne(0)) { exit }
+# 두 번째 실행은 이미 떠 있는 위젯에 '창 열기' 신호만 보내고 끝낸다(숨긴 창을 바로가기로 다시 열 수 있게)
+$showSignal = New-Object Threading.EventWaitHandle($false, 'AutoReset', 'Local\CiStatusWidget.Show')
+if (-not $Snapshot -and -not $mutex.WaitOne(0)) { [void]$showSignal.Set(); exit }
+$hiddenFile = Join-Path $env:LOCALAPPDATA 'ci-widget.hidden'   # 있으면 다음 실행 때 숨긴 채로 시작
 
 # gh 조회는 별도 실행 공간에서 돌려 창이 멈추지 않게 한다
 $fetch = {
@@ -94,7 +97,7 @@ $TF = [Windows.Forms.TextFormatFlags]
 $flags = $TF::SingleLine -bor $TF::VerticalCenter -bor $TF::EndEllipsis -bor $TF::NoPrefix
 
 $form = New-Object Windows.Forms.Form -Property @{
-    Text = 'CI 현황'; TopMost = $true; Font = $fontBody; Size = '900,500'; MinimumSize = '560,260'
+    Text = 'CI 현황'; TopMost = $true; Font = $fontBody; Size = '900,500'; MinimumSize = '720,260'
     BackColor = $T.bg; ForeColor = $T.fg
 }
 $wa = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
@@ -117,12 +120,17 @@ $miniBtn = New-Object Windows.Forms.Button -Property @{
     Text = '미니 모드'; Size = '92,30'; FlatStyle = 'Flat'; BackColor = $T.surface; ForeColor = $T.fg
     Anchor = 'Top,Right'; Cursor = [Windows.Forms.Cursors]::Hand
 }
-foreach ($b in $btn, $miniBtn) { $b.FlatAppearance.BorderColor = $T.border; $b.FlatAppearance.MouseOverBackColor = $T.selected }
-$head.Controls.AddRange(@($btn, $pin, $miniBtn))
+$hideBtn = New-Object Windows.Forms.Button -Property @{
+    Text = '숨기기'; Size = '72,30'; FlatStyle = 'Flat'; BackColor = $T.surface; ForeColor = $T.fg
+    Anchor = 'Top,Right'; Cursor = [Windows.Forms.Cursors]::Hand
+}
+foreach ($b in $btn, $miniBtn, $hideBtn) { $b.FlatAppearance.BorderColor = $T.border; $b.FlatAppearance.MouseOverBackColor = $T.selected }
+$head.Controls.AddRange(@($btn, $pin, $miniBtn, $hideBtn))
 function Place-Head {
     $btn.Location = New-Object Drawing.Point(($head.Width - $btn.Width - 14), 12)
     $pin.Location = New-Object Drawing.Point(($btn.Left - $pin.PreferredSize.Width - 12), 18)
     $miniBtn.Location = New-Object Drawing.Point(($pin.Left - $miniBtn.Width - 12), 12)
+    $hideBtn.Location = New-Object Drawing.Point(($miniBtn.Left - $hideBtn.Width - 8), 12)
 }
 
 # 미니 막대: 진행 중·대기 건수만 그린다
@@ -130,9 +138,11 @@ $miniBar = New-Object Windows.Forms.Panel -Property @{ Dock = 'Fill'; BackColor 
 $expand = New-Object Windows.Forms.Button -Property @{
     Text = '펼치기'; Size = '64,28'; FlatStyle = 'Flat'; BackColor = $T.surface; ForeColor = $T.fg; Cursor = [Windows.Forms.Cursors]::Hand
 }
-$expand.FlatAppearance.BorderColor = $T.border
-$expand.FlatAppearance.MouseOverBackColor = $T.selected
-$miniBar.Controls.Add($expand)
+$hideMini = New-Object Windows.Forms.Button -Property @{
+    Text = '숨기기'; Size = '64,28'; FlatStyle = 'Flat'; BackColor = $T.surface; ForeColor = $T.fg; Cursor = [Windows.Forms.Cursors]::Hand
+}
+foreach ($b in $expand, $hideMini) { $b.FlatAppearance.BorderColor = $T.border; $b.FlatAppearance.MouseOverBackColor = $T.selected }
+$miniBar.Controls.AddRange(@($expand, $hideMini))
 $tips = New-Object Windows.Forms.ToolTip
 $tips.SetToolTip($miniBar, '끌어서 옮기기 · 두 번 클릭하면 펼침')
 
@@ -188,6 +198,9 @@ function Render($runs) {
         if ($x.url -eq $sel) { $it.Selected = $true }
     }
     $list.EndUpdate()
+    # 항목이 늘어 세로 스크롤바가 생기면 폭이 줄어드는데 Resize가 안 와서 가로 스크롤바가 생겼다.
+    # 스크롤바 배치가 끝난 뒤 칸 폭을 다시 맞추도록 메시지 큐 뒤로 미룬다
+    if ($list.IsHandleCreated) { [void]$list.BeginInvoke([Action]{ Fit-Columns }) }
     $failed = @($runs | Where-Object error | ForEach-Object repo)
     $script:updated = $now
     $script:note = if ($failed) { "조회 실패: $($failed -join ', ')" } else { '' }
@@ -251,41 +264,46 @@ $list.Add_DrawColumnHeader({
     [Windows.Forms.TextRenderer]::DrawText($e.Graphics, $e.Header.Text, $fontSection, $r, $T.muted, $flags)
 })
 
+# 행 전체를 DrawItem 한 곳에서 그린다. 마우스를 올리면(핫 트래킹) WinForms가 DrawItem만 다시 부르고
+# DrawSubItem은 부르지 않아서, 칸 글자를 DrawSubItem에서 그리면 배경만 덮이고 글자가 사라졌다.
 $list.Add_DrawItem({
     param($s, $e)
     $tag = $e.Item.Tag
-    $g = $e.Graphics
+    $g = $e.Graphics; $g.SmoothingMode = 'AntiAlias'
     $bgc = if ($e.Item.Selected -and $tag.kind -eq 'run') { $T.selected } else { $T.surface }
     $b = New-Object Drawing.SolidBrush($bgc); $g.FillRectangle($b, $e.Bounds); $b.Dispose()
     if ($tag.kind -eq 'section') {
         $r = New-Object Drawing.Rectangle(($e.Bounds.X + 10), ($e.Bounds.Y + 6), ($e.Bounds.Width - 20), ($e.Bounds.Height - 6))
         [Windows.Forms.TextRenderer]::DrawText($g, $e.Item.Text, $fontSection, $r, $T.muted, $flags)
-    } elseif ($tag.kind -eq 'empty') {
-        $r = New-Object Drawing.Rectangle(($e.Bounds.X + 30), $e.Bounds.Y, ($e.Bounds.Width - 40), $e.Bounds.Height)
-        [Windows.Forms.TextRenderer]::DrawText($g, $e.Item.Text, $fontBody, $r, $T.muted, $flags)
-    }
-})
-
-$list.Add_DrawSubItem({
-    param($s, $e)
-    $tag = $e.Item.Tag
-    if ($tag.kind -ne 'run') { return }
-    $g = $e.Graphics; $g.SmoothingMode = 'AntiAlias'
-    $bd = $e.Bounds
-    if ($e.ColumnIndex -eq 0) {
-        $tone = $T[$tag.tone]
-        $cy = $bd.Y + [int](($bd.Height - 8) / 2)
-        if ($tag.hollow) { $p = New-Object Drawing.Pen($tone, 1.6); $g.DrawEllipse($p, ($bd.X + 12), $cy, 8, 8); $p.Dispose() }
-        else { $b = New-Object Drawing.SolidBrush($tone); $g.FillEllipse($b, ($bd.X + 12), $cy, 8, 8); $b.Dispose() }
-        $r = New-Object Drawing.Rectangle(($bd.X + 26), $bd.Y, ($bd.Width - 28), $bd.Height)
-        [Windows.Forms.TextRenderer]::DrawText($g, $e.SubItem.Text, $fontBold, $r, $tone, $flags)
         return
     }
-    $font = if ($e.ColumnIndex -ge 4) { $fontNum } else { $fontBody }
-    $color = if ($e.ColumnIndex -in 1, 2) { $T.fg } else { $T.muted }
-    $r = New-Object Drawing.Rectangle(($bd.X + 10), $bd.Y, ($bd.Width - 14), $bd.Height)
-    [Windows.Forms.TextRenderer]::DrawText($g, $e.SubItem.Text, $font, $r, $color, $flags)
+    if ($tag.kind -eq 'empty') {
+        $r = New-Object Drawing.Rectangle(($e.Bounds.X + 30), $e.Bounds.Y, ($e.Bounds.Width - 40), $e.Bounds.Height)
+        [Windows.Forms.TextRenderer]::DrawText($g, $e.Item.Text, $fontBody, $r, $T.muted, $flags)
+        return
+    }
+    $x = $e.Bounds.X
+    for ($i = 0; $i -lt $list.Columns.Count; $i++) {
+        $cw = $list.Columns[$i].Width
+        $text = $e.Item.SubItems[$i].Text
+        if ($i -eq 0) {
+            $tone = $T[$tag.tone]
+            $cy = $e.Bounds.Y + [int](($e.Bounds.Height - 8) / 2)
+            if ($tag.hollow) { $pen = New-Object Drawing.Pen($tone, 1.6); $g.DrawEllipse($pen, ($x + 12), $cy, 8, 8); $pen.Dispose() }
+            else { $b = New-Object Drawing.SolidBrush($tone); $g.FillEllipse($b, ($x + 12), $cy, 8, 8); $b.Dispose() }
+            $r = New-Object Drawing.Rectangle(($x + 26), $e.Bounds.Y, ($cw - 28), $e.Bounds.Height)
+            [Windows.Forms.TextRenderer]::DrawText($g, $text, $fontBold, $r, $tone, $flags)
+        } else {
+            $font = if ($i -ge 4) { $fontNum } else { $fontBody }
+            $color = if ($i -in 1, 2) { $T.fg } else { $T.muted }
+            $r = New-Object Drawing.Rectangle(($x + 10), $e.Bounds.Y, ($cw - 14), $e.Bounds.Height)
+            [Windows.Forms.TextRenderer]::DrawText($g, $text, $font, $r, $color, $flags)
+        }
+        $x += $cw
+    }
 })
+# DrawItem이 이미 다 그렸으므로 칸 단위 그리기는 하지 않는다(OwnerDraw라 처리기는 있어야 기본 그리기가 안 끼어든다)
+$list.Add_DrawSubItem({ param($s, $e) })
 
 # --- 작업표시줄 막대 --------------------------------------------------------
 # kindsusu/codex-usage-widget의 작업표시줄 막대와 같은 방식: 계층(layered) 창을 WS_CHILD로 바꿔 작업표시줄(Shell_TrayWnd) 안에 붙이고
@@ -293,15 +311,38 @@ $list.Add_DrawSubItem({
 # 그 위젯 막대는 작업표시줄 왼쪽을 쓰므로, 이 막대는 알림 영역(TrayNotifyWnd) 바로 왼쪽에 둔다.
 # 순서가 중요하다: 처음부터 계층·숨김 상태로 만든다 → 자식으로 붙인다 → 그린다 → 보인다.
 # WinForms 폼을 먼저 띄워 놓고 바꾸는 방식은 UpdateLayeredWindow가 성공해도 화면에 나타나지 않았다(2026-10-28 실측).
-# ponytail: 빈 자리를 찾지 않고 알림 영역 왼쪽에 고정한다. 작업표시줄 아이콘을 왼쪽 정렬하고 앱을 많이 띄우면 겹칠 수 있다.
+# 기본 자리는 알림 영역 바로 왼쪽. 막대를 좌우로 끌어 옮기면 그 자리(작업표시줄 안 x)를 기억한다.
+# 놓을 때 사용량 위젯 막대와 겹치면 가까운 옆으로 비켜 선다.
+# ponytail: 작업표시줄 앱 아이콘은 피하지 않는다(UIA 탐색 없음). 아이콘 위에 놓으면 겹친다.
 # ponytail: 막대 크기·글꼴은 100% 배율(96 DPI) 기준이다. 배율을 올리면 막대가 작게 보인다.
 Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 public class CiStripWindow : NativeWindow {
+    [StructLayout(LayoutKind.Sequential)] struct PT { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] struct RC { public int L, T, R, B; }
+    delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
-    public event EventHandler LeftClick, RightClick;
+    [DllImport("user32.dll")] static extern IntPtr SetCapture(IntPtr h);
+    [DllImport("user32.dll")] static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out PT p);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RC r);
+    [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr h);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int w, int hh, uint f);
+    [DllImport("user32.dll")] static extern IntPtr LoadCursor(IntPtr inst, int id);
+    [DllImport("user32.dll")] static extern IntPtr SetCursor(IntPtr c);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumProc f, IntPtr l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+
+    public event EventHandler LeftClick, RightClick, Dropped;
+    public int MinX, MaxX, Y;          // 끌 수 있는 범위(작업표시줄 안 좌표)
+    public int DroppedX;
+    bool pressed, dragging;
+    int startCursor, startX;
+
     public CiStripWindow() {
         var cp = new CreateParams();
         cp.Caption = "CI status strip";
@@ -311,25 +352,90 @@ public class CiStripWindow : NativeWindow {
         IntPtr old = SetThreadDpiAwarenessContext(new IntPtr(-4));   // 작업표시줄과 같은 실제 픽셀 좌표계
         try { CreateHandle(cp); } finally { SetThreadDpiAwarenessContext(old); }
     }
+
+    int CurrentX() {
+        RC me, parent; GetWindowRect(Handle, out me); GetWindowRect(GetParent(Handle), out parent);
+        return me.L - parent.L;
+    }
+
+    // 작업표시줄에 붙은 사용량 위젯 막대(codex/claude-usage-widget)의 가로 구간. [왼쪽, 오른쪽, 왼쪽, 오른쪽, ...]
+    public static int[] SiblingSpans(IntPtr taskbar, IntPtr self) {
+        var spans = new List<int>();
+        RC tb; GetWindowRect(taskbar, out tb);
+        EnumChildWindows(taskbar, (h, l) => {
+            if (h == self || GetParent(h) != taskbar) return true;
+            var sb = new StringBuilder(256); GetClassName(h, sb, 256);
+            string c = sb.ToString();
+            if (c.StartsWith("CodexUsageTaskbar") || c.StartsWith("ClaudeUsageTaskbarSurface")) {
+                RC r; GetWindowRect(h, out r); spans.Add(r.L - tb.L); spans.Add(r.R - tb.L);
+            }
+            return true;
+        }, IntPtr.Zero);
+        return spans.ToArray();
+    }
+
     protected override void WndProc(ref Message m) {
-        if (m.Msg == 0x0021) { m.Result = new IntPtr(3); return; }                 // WM_MOUSEACTIVATE → MA_NOACTIVATE
-        if (m.Msg == 0x0202 && LeftClick != null) LeftClick(this, EventArgs.Empty);   // WM_LBUTTONUP
-        if (m.Msg == 0x0205 && RightClick != null) RightClick(this, EventArgs.Empty); // WM_RBUTTONUP
+        switch (m.Msg) {
+            case 0x0021: m.Result = new IntPtr(3); return;     // WM_MOUSEACTIVATE → MA_NOACTIVATE
+            case 0x0020:                                        // WM_SETCURSOR: 평소 손, 끄는 중 좌우 화살표
+                SetCursor(LoadCursor(IntPtr.Zero, dragging ? 32644 : 32649)); m.Result = new IntPtr(1); return;
+            case 0x0201: {                                      // WM_LBUTTONDOWN: 누른 자리 기억
+                PT c; GetCursorPos(out c);
+                pressed = true; dragging = false; startCursor = c.X; startX = CurrentX();
+                SetCapture(Handle);
+                return;
+            }
+            case 0x0200:                                        // WM_MOUSEMOVE: 4px 넘게 움직이면 끌기
+                if (pressed) {
+                    PT c; GetCursorPos(out c);
+                    int dx = c.X - startCursor;
+                    if (!dragging && Math.Abs(dx) >= 4) dragging = true;
+                    if (dragging) {
+                        int nx = Math.Max(MinX, Math.Min(MaxX, startX + dx));
+                        SetWindowPos(Handle, IntPtr.Zero, nx, Y, 0, 0, 0x0001 | 0x0004 | 0x0010);   // NOSIZE|NOZORDER|NOACTIVATE
+                        SetCursor(LoadCursor(IntPtr.Zero, 32644));
+                    }
+                }
+                break;
+            case 0x0202:                                        // WM_LBUTTONUP: 끌었으면 놓기, 아니면 클릭
+                if (pressed) {
+                    pressed = false; bool wasDrag = dragging; dragging = false;
+                    ReleaseCapture();
+                    if (wasDrag) { DroppedX = CurrentX(); if (Dropped != null) Dropped(this, EventArgs.Empty); }
+                    else if (LeftClick != null) LeftClick(this, EventArgs.Empty);
+                }
+                return;
+            case 0x0215:                                        // WM_CAPTURECHANGED: 끌다가 포커스를 잃으면 그 자리에 놓는다
+                if (pressed) {
+                    pressed = false; bool wasDrag = dragging; dragging = false;
+                    if (wasDrag) { DroppedX = CurrentX(); if (Dropped != null) Dropped(this, EventArgs.Empty); }
+                }
+                break;
+            case 0x0205:                                        // WM_RBUTTONUP
+                if (RightClick != null) RightClick(this, EventArgs.Empty);
+                break;
+        }
         base.WndProc(ref m);
     }
 }
 "@
 $StripW = 118; $StripH = 40
+$stripPosFile = Join-Path $env:LOCALAPPDATA 'ci-widget.strip'   # 옮긴 막대의 x(작업표시줄 안 좌표)
 $script:stripParent = [IntPtr]::Zero
 $script:stripBack = $T.bg
 $stripMenu = New-Object Windows.Forms.ContextMenuStrip
 [void]$stripMenu.Items.Add('창 열기/숨기기', $null, { Toggle-Main })
 [void]$stripMenu.Items.Add('새로고침', $null, { $script:tick = 0; Start-Fetch })
+[void]$stripMenu.Items.Add('막대 위치 초기화', $null, { Remove-Item $stripPosFile -ErrorAction SilentlyContinue; Attach-Strip })
 [void]$stripMenu.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
 [void]$stripMenu.Items.Add('종료', $null, { Exit-App })
 function New-StripWindow {
     $w = New-Object CiStripWindow
     $w.add_LeftClick({ Toggle-Main })
+    $w.add_Dropped({
+        try { [IO.File]::WriteAllText($stripPosFile, [string]$script:sw.DroppedX) } catch {}
+        Attach-Strip
+    })
     $w.add_RightClick({
         $stripMenu.Show([Windows.Forms.Cursor]::Position)
         # 활성화하지 않는 창에서 띄운 메뉴는 바깥을 눌러도 안 닫힌다. 메뉴를 전경으로 올린다
@@ -348,7 +454,8 @@ function Draw-Strip([Drawing.Graphics]$g, [int]$w, [int]$h) {
     $light = $script:stripBack.GetBrightness() -gt 0.5
     $fg = if ($light) { C '#0F172A' } else { $T.fg }
     $dim = if ($light) { C '#475569' } else { $T.muted }
-    $tones = if ($light) { @{ running = C '#0369A1'; queued = C '#B45309' } } else { @{ running = $T.running; queued = $T.queued } }
+    # 작업표시줄 막대에서는 실행 중을 초록으로 보여 준다(사용자 요청). 밝은 작업표시줄은 대비를 위해 진한 초록
+    $tones = if ($light) { @{ running = C '#15803D'; queued = C '#B45309' } } else { @{ running = $T.success; queued = $T.queued } }
     $sf = New-Object Drawing.StringFormat -Property @{ LineAlignment = 'Center'; FormatFlags = 'NoWrap' }
     $b = New-Object Drawing.SolidBrush($dim); $g.DrawString('CI', $fontStripTitle, $b, (New-Object Drawing.RectangleF(2, 0, 30, $h)), $sf); $b.Dispose()
     $y = [int](($h - 36) / 2)
@@ -388,6 +495,21 @@ function Update-Strip {
     $bmp.Dispose()
 }
 
+# 사용량 위젯 막대([왼쪽, 오른쪽, ...])와 겹치면, 아무것과도 안 겹치는 자리 중 놓은 곳에서 가장 가까운 곳으로 비킨다
+function Resolve-StripX([int]$x, [int[]]$spans, [int]$minX, [int]$maxX) {
+    $x = [Math]::Max($minX, [Math]::Min($maxX, $x))
+    $cands = @($x, $minX, $maxX)
+    for ($i = 0; $i + 1 -lt $spans.Count; $i += 2) { $cands += $spans[$i] - $StripW - 4; $cands += $spans[$i + 1] + 4 }
+    $best = $null
+    foreach ($c in $cands) {
+        if ($c -lt $minX -or $c -gt $maxX) { continue }
+        $hit = $false
+        for ($i = 0; $i + 1 -lt $spans.Count; $i += 2) { if ($c -lt $spans[$i + 1] -and ($c + $StripW) -gt $spans[$i]) { $hit = $true; break } }
+        if (-not $hit -and ($null -eq $best -or [Math]::Abs($c - $x) -lt [Math]::Abs($best - $x))) { $best = $c }
+    }
+    if ($null -eq $best) { $x } else { $best }
+}
+
 function Attach-Strip {
     $N = [CiWidget.Native]
     $tb = $N::FindWindow('Shell_TrayWnd', $null)
@@ -396,7 +518,12 @@ function Attach-Strip {
     $right = $rb.Right
     $tray = $N::FindWindowEx($tb, [IntPtr]::Zero, 'TrayNotifyWnd', $null)
     if ($tray -ne [IntPtr]::Zero) { $rt = New-Object CiWidget.Native+RECT; [void]$N::GetWindowRect($tray, [ref]$rt); $right = $rt.Left }
-    $x = $right - $rb.Left - $StripW - 8
+    $minX = 4; $maxX = $right - $rb.Left - $StripW - 8
+    $x = $maxX
+    if (Test-Path $stripPosFile) { $saved = 0; if ([int]::TryParse((Get-Content $stripPosFile -Raw).Trim(), [ref]$saved)) { $x = $saved } }
+    $x = [Math]::Max($minX, [Math]::Min($maxX, $x))
+    $self = if ($script:sw) { $script:sw.Handle } else { [IntPtr]::Zero }
+    $x = Resolve-StripX $x ([CiStripWindow]::SiblingSpans($tb, $self)) $minX $maxX
     $y = [int](($rb.Bottom - $rb.Top - $StripH) / 2)
     # 바탕색은 막대 바로 왼쪽 작업표시줄 한 점을 읽어 정한다(밝은/어두운 작업표시줄에 맞춰 글자색을 고르려고)
     try {
@@ -410,6 +537,7 @@ function Attach-Strip {
         if ($script:sw -and $script:sw.Handle -ne [IntPtr]::Zero) { $script:sw.DestroyHandle() }
         $script:sw = New-StripWindow
         $h = $script:sw.Handle
+        $script:sw.MinX = $minX; $script:sw.MaxX = $maxX; $script:sw.Y = $y
         $style = $N::GetWindowLongPtr($h, -16).ToInt64()
         $style = ($style -band -bnot 0x80000000L) -bor 0x40000000L -bor 0x04000000L   # WS_POPUP 빼고 WS_CHILD|WS_CLIPSIBLINGS
         [void]$N::SetWindowLongPtr($h, -16, [IntPtr]$style)
@@ -420,6 +548,7 @@ function Attach-Strip {
         [void]$N::ShowWindow($h, 4)   # SW_SHOWNOACTIVATE
         return
     }
+    $script:sw.MinX = $minX; $script:sw.MaxX = $maxX; $script:sw.Y = $y
     [void]$N::SetWindowPos($script:sw.Handle, [IntPtr]::Zero, $x, $y, $StripW, $StripH, 0x0010 -bor 0x0004)   # NOACTIVATE|NOZORDER
     Update-Strip
 }
@@ -446,10 +575,10 @@ function Set-Mini([bool]$on) {
     if ($on) {
         $script:fullSize = $form.Size
         $head.Visible = $false; $list.Visible = $false; $miniBar.Visible = $true
-        $form.FormBorderStyle = 'None'; $form.MinimumSize = '0,0'; $form.Size = '330,48'
+        $form.FormBorderStyle = 'None'; $form.MinimumSize = '0,0'; $form.Size = '400,48'
     } else {
         $miniBar.Visible = $false; $head.Visible = $true; $list.Visible = $true
-        $form.FormBorderStyle = 'Sizable'; $form.Size = $script:fullSize; $form.MinimumSize = '560,260'
+        $form.FormBorderStyle = 'Sizable'; $form.Size = $script:fullSize; $form.MinimumSize = '720,260'
     }
     # 오른쪽 아래 모서리를 기준으로 제자리에서 접고 펼친다(화면 밖으로 나가지 않게)
     $wa = [Windows.Forms.Screen]::FromRectangle($r).WorkingArea
@@ -457,15 +586,22 @@ function Set-Mini([bool]$on) {
     $y = [Math]::Max($wa.Top, [Math]::Min($r.Bottom - $form.Height, $wa.Bottom - $form.Height))
     $form.Location = New-Object Drawing.Point($x, $y)
     $expand.Location = New-Object Drawing.Point(($miniBar.Width - $expand.Width - 10), [int](($miniBar.Height - $expand.Height) / 2))
+    $hideMini.Location = New-Object Drawing.Point(($expand.Left - $hideMini.Width - 6), $expand.Top)
     if (-not $Snapshot) { try { [IO.File]::WriteAllText($modeFile, $(if ($on) { 'mini' } else { 'full' })) } catch {} }
 }
-function Toggle-Main {
-    if ($form.Visible -and $form.WindowState -ne 'Minimized') { $form.Hide() }
-    else { $form.Show(); $form.WindowState = 'Normal'; $form.Activate() }
+# 숨기기: 창만 감추고 작업표시줄 막대는 남긴다. 숨긴 상태는 기억해서 다음 실행 때도 숨긴 채로 시작한다
+function Hide-Main {
+    $form.Hide()
+    try { [IO.File]::WriteAllText($hiddenFile, '') } catch {}
 }
+function Show-Main {
+    $form.Show(); $form.WindowState = 'Normal'; $form.Activate()
+    Remove-Item $hiddenFile -ErrorAction SilentlyContinue
+}
+function Toggle-Main { if ($form.Visible -and $form.WindowState -ne 'Minimized') { Hide-Main } else { Show-Main } }
 function Exit-App { $script:exiting = $true; $timer.Stop(); if ($script:sw) { $script:sw.DestroyHandle() }; $form.Close(); [Windows.Forms.Application]::Exit() }
 # 창의 X는 작업표시줄 막대로 숨기기만 한다(종료는 막대 오른쪽 클릭 메뉴)
-$form.Add_FormClosing({ param($s, $e) if (-not $script:exiting -and $e.CloseReason -eq 'UserClosing') { $e.Cancel = $true; $form.Hide() } })
+$form.Add_FormClosing({ param($s, $e) if (-not $script:exiting -and $e.CloseReason -eq 'UserClosing') { $e.Cancel = $true; Hide-Main } })
 function Open-Selected {
     if ($list.SelectedItems.Count -and $list.SelectedItems[0].Tag.url) { Start-Process $list.SelectedItems[0].Tag.url }
 }
@@ -477,6 +613,8 @@ $list.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Enter') { Open-Selected } 
 # 구분 행·빈 행은 선택되지 않게 한다
 $list.Add_ItemSelectionChanged({ param($s, $e) if ($e.IsSelected -and $e.Item.Tag.kind -ne 'run') { $e.Item.Selected = $false } })
 $miniBtn.Add_Click({ Set-Mini $true })
+$hideBtn.Add_Click({ Hide-Main })
+$hideMini.Add_Click({ Hide-Main })
 $expand.Add_Click({ Set-Mini $false })
 # 미니 막대는 아무 데나 끌어서 옮기고, 두 번 클릭하면 펼친다
 $miniBar.Add_MouseDown({
@@ -490,7 +628,7 @@ $head.Add_Resize({ Place-Head; $head.Invalidate() })
 # '내용' 칸이 남는 폭을 채워 머리글 오른쪽에 빈 칸(흰 띠)이 생기지 않게 한다
 function Fit-Columns {
     $other = 0; foreach ($i in 0, 1, 3, 4, 5) { $other += $list.Columns[$i].Width }
-    $list.Columns[2].Width = [Math]::Max(160, $list.ClientSize.Width - $other)
+    $list.Columns[2].Width = [Math]::Max(160, $list.ClientSize.Width - $other - 1)
 }
 $list.Add_Resize({ Fit-Columns })
 # 테두리 방식을 바꾸면 창 핸들이 다시 만들어질 수 있어 그때마다 어두운 제목 표시줄을 다시 건다
@@ -526,12 +664,12 @@ $timer.Add_Tick({
     if (++$script:tick -ge $RefreshSec) { $script:tick = 0; Start-Fetch }
     # 탐색기 재시작·해상도 변경에 대비해 10초마다 자리를 다시 맞춘다(창 찾기·위치 지정뿐이라 가볍다)
     if (++$script:stripTick -ge 10) { $script:stripTick = 0; try { Attach-Strip } catch { $script:note = "작업표시줄: $($_.Exception.Message)"; $_ | Out-File (Join-Path $env:TEMP 'ci-widget-strip.err') } }
+    if ($showSignal.WaitOne(0)) { Show-Main }
 })
-$form.Add_Shown({
-    if ($startMini) { Set-Mini $true }
-    try { Attach-Strip } catch { $script:note = "작업표시줄: $($_.Exception.Message)"; $_ | Out-File (Join-Path $env:TEMP 'ci-widget-strip.err') }
-    Start-Fetch; $timer.Start()
-})
+# 처음 보일 때(숨긴 채 시작했으면 처음 열 때) 지난 모드를 적용한다
+$form.Add_Shown({ if ($startMini) { Set-Mini $true } })
+try { Attach-Strip } catch { $script:note = "작업표시줄: $($_.Exception.Message)"; $_ | Out-File (Join-Path $env:TEMP 'ci-widget-strip.err') }
+Start-Fetch; $timer.Start()
 # 창을 숨겨도 계속 돌도록 창 없는 메시지 루프로 돌린다(종료는 Exit-App)
-$form.Show()
+if (-not (Test-Path $hiddenFile)) { $form.Show() }
 [Windows.Forms.Application]::Run((New-Object Windows.Forms.ApplicationContext))
