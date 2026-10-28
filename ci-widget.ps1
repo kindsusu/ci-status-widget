@@ -163,7 +163,19 @@ function Span([TimeSpan]$t) {
     else { '{0}초' -f [int]$t.TotalSeconds }
 }
 
-$script:summary = @{ running = 0; queued = 0; failure = 0 }
+$script:summary = @{ all = 0; running = 0; queued = 0; failure = 0; done = 0 }
+# 상태 필터: 머리의 칩을 누르면 그 상태만 보인다
+$script:filter = 'all'
+$script:lastRuns = @()
+$script:chipRects = @()
+$Filters = @(
+    @{ key = 'all';     label = '전체';    empty = '표시할 CI가 없습니다.' }
+    @{ key = 'running'; label = '실행 중'; empty = '지금 실행 중인 CI가 없습니다.' }
+    @{ key = 'queued';  label = '대기';    empty = '대기 중인 CI가 없습니다.' }
+    @{ key = 'failure'; label = '실패';    empty = '최근 실패한 CI가 없습니다.' }
+    @{ key = 'done';    label = '완료';    empty = '최근 완료된 CI가 없습니다.' }
+)
+function Set-Filter($key) { $script:filter = $key; Render $script:lastRuns }
 function Add-Row($kind, $cells, $tag) {
     $it = [Windows.Forms.ListViewItem]::new([string[]]$cells)
     $it.Tag = @{ kind = $kind } + $tag
@@ -176,18 +188,34 @@ function Render($runs) {
     $ok = @($runs | Where-Object { -not $_.error })
     $active = @($ok | Where-Object status -ne 'completed' | Sort-Object createdAt)
     $done = @($ok | Where-Object status -eq 'completed' | Sort-Object createdAt -Descending | Select-Object -First $DoneCount)
+    $script:lastRuns = $runs
+    $running = @($active | Where-Object status -eq 'in_progress')
+    $queued = @($active | Where-Object status -ne 'in_progress')
+    $failures = @($done | Where-Object { $State[$_.conclusion] -and $State[$_.conclusion][1] -eq 'failure' })
     $script:summary = @{
-        running = @($active | Where-Object status -eq 'in_progress').Count
-        queued = @($active | Where-Object status -ne 'in_progress').Count
-        failure = @($done | Where-Object { $State[$_.conclusion] -and $State[$_.conclusion][1] -eq 'failure' }).Count
+        all = $active.Count + $done.Count; running = $running.Count; queued = $queued.Count; failure = $failures.Count; done = $done.Count
+    }
+    # 필터별 구역: (제목, 실행들). '전체'만 진행 중/최근 완료 두 구역으로 나눈다
+    $f = $Filters | Where-Object key -eq $script:filter
+    $sections = New-Object Collections.ArrayList
+    switch ($script:filter) {
+        'running' { [void]$sections.Add(@('실행 중', $running)) }
+        'queued'  { [void]$sections.Add(@('대기', $queued)) }
+        'failure' { [void]$sections.Add(@('실패', $failures)) }
+        'done'    { [void]$sections.Add(@('최근 완료', $done)) }
+        default   { [void]$sections.Add(@('진행 중', $active)); [void]$sections.Add(@('최근 완료', $done)) }
     }
     $sel = if ($list.SelectedItems.Count) { $list.SelectedItems[0].Tag.url }
     $list.BeginUpdate(); $list.Items.Clear()
-    [void](Add-Row 'section' @("진행 중 · $($active.Count)") @{})
-    if (-not $active.Count) { [void](Add-Row 'empty' @('지금 실행 중이거나 대기 중인 CI가 없습니다.') @{}) }
-    $first = $true
-    foreach ($x in $active + $done) {
-        if ($x.status -eq 'completed' -and $first) { $first = $false; [void](Add-Row 'section' @("최근 완료 · $($done.Count)") @{}) }
+    foreach ($sec in $sections) {
+        $rows = @($sec[1])
+        [void](Add-Row 'section' @("$($sec[0]) · $($rows.Count)") @{})
+        if (-not $rows.Count) {
+            $msg = if ($script:filter -eq 'all' -and $sec[0] -eq '진행 중') { '지금 실행 중이거나 대기 중인 CI가 없습니다.' } else { $f.empty }
+            [void](Add-Row 'empty' @($msg) @{})
+            continue
+        }
+        foreach ($x in $rows) {
         $key = if ($x.status -eq 'completed') { $x.conclusion } else { $x.status }
         $st = if ($State[$key]) { $State[$key] } else { $key, 'neutral', $true }
         $start = [DateTimeOffset]::Parse($x.createdAt).LocalDateTime
@@ -196,6 +224,7 @@ function Render($runs) {
         $it = Add-Row 'run' @($st[0], $x.repo, $title, $x.headBranch, $start.ToString('HH:mm'), (Span ($end - $start))) @{ url = $x.url; tone = $st[1]; hollow = $st[2] }
         $it.ToolTipText = "$($x.name)`n$title`n$($x.headBranch)"
         if ($x.url -eq $sel) { $it.Selected = $true }
+        }
     }
     $list.EndUpdate()
     # 항목이 늘어 세로 스크롤바가 생기면 폭이 줄어드는데 Resize가 안 와서 가로 스크롤바가 생겼다.
@@ -218,20 +247,25 @@ $head.Add_Paint({
            else { '' }
     $tw = [Windows.Forms.TextRenderer]::MeasureText('CI 현황', $fontTitle).Width
     [Windows.Forms.TextRenderer]::DrawText($g, $sub, $fontBody, (New-Object Drawing.Point((12 + $tw + 6), 15)), $T.muted)
-    # 요약 칩: 점 + 글자
+    # 필터 칩: 점 + 글자 + 건수. 누르면 그 상태만 보이고, 고른 칩은 밝은 테두리·배경으로 표시한다
     $x = 14
-    foreach ($chip in @(('running', '실행 중'), ('queued', '대기'), ('failure', '최근 실패'))) {
-        $n = $script:summary[$chip[0]]
-        $text = "$($chip[1]) $n"
+    $rects = @()
+    foreach ($f in $Filters) {
+        $n = $script:summary[$f.key]
+        $text = "$($f.label) $n"
         $w = [Windows.Forms.TextRenderer]::MeasureText($text, $fontBold).Width + 26
         $rect = New-Object Drawing.Rectangle($x, 44, $w, 24)
-        $tone = if ($n) { $T[$chip[0]] } else { $T.muted }
-        $b = New-Object Drawing.SolidBrush($T.surface); $g.FillRectangle($b, $rect); $b.Dispose()
-        $p = New-Object Drawing.Pen($T.border); $g.DrawRectangle($p, $rect); $p.Dispose()
+        $on = $script:filter -eq $f.key
+        $toneKey = @{ all = 'fg'; running = 'running'; queued = 'queued'; failure = 'failure'; done = 'success' }[$f.key]
+        $tone = if ($n) { $T[$toneKey] } else { $T.muted }
+        $b = New-Object Drawing.SolidBrush($(if ($on) { $T.selected } else { $T.surface })); $g.FillRectangle($b, $rect); $b.Dispose()
+        $p = New-Object Drawing.Pen($(if ($on) { $T.fg } else { $T.border })); $g.DrawRectangle($p, $rect); $p.Dispose()
         $b = New-Object Drawing.SolidBrush($tone); $g.FillEllipse($b, ($x + 9), 52, 8, 8); $b.Dispose()
-        [Windows.Forms.TextRenderer]::DrawText($g, $text, $fontBold, (New-Object Drawing.Rectangle(($x + 20), 44, ($w - 20), 24)), $(if ($n) { $T.fg } else { $T.muted }), $flags)
-        $x += $w + 8
+        [Windows.Forms.TextRenderer]::DrawText($g, $text, $fontBold, (New-Object Drawing.Rectangle(($x + 20), 44, ($w - 20), 24)), $(if ($n -or $on) { $T.fg } else { $T.muted }), $flags)
+        $rects += @{ key = $f.key; rect = $rect }
+        $x += $w + 6
     }
+    $script:chipRects = $rects
     if ($script:note) {
         [Windows.Forms.TextRenderer]::DrawText($g, $script:note, $fontBody, (New-Object Drawing.Rectangle(($x + 6), 44, ($head.Width - $x - 20), 24)), $T.failure, $flags)
     }
@@ -339,7 +373,7 @@ public class CiStripWindow : NativeWindow {
 
     public event EventHandler LeftClick, RightClick, Dropped;
     public int MinX, MaxX, Y;          // 끌 수 있는 범위(작업표시줄 안 좌표)
-    public int DroppedX;
+    public int DroppedX, DropScreenX, DropScreenY, GrabOffset;   // 놓은 자리(작업표시줄 안 x), 놓을 때 커서(화면), 막대 왼쪽에서 잡은 위치
     bool pressed, dragging;
     int startCursor, startX;
 
@@ -374,6 +408,12 @@ public class CiStripWindow : NativeWindow {
         return spans.ToArray();
     }
 
+    void Drop() {
+        PT c; GetCursorPos(out c);
+        DroppedX = CurrentX(); DropScreenX = c.X; DropScreenY = c.Y;
+        if (Dropped != null) Dropped(this, EventArgs.Empty);
+    }
+
     protected override void WndProc(ref Message m) {
         switch (m.Msg) {
             case 0x0021: m.Result = new IntPtr(3); return;     // WM_MOUSEACTIVATE → MA_NOACTIVATE
@@ -382,6 +422,7 @@ public class CiStripWindow : NativeWindow {
             case 0x0201: {                                      // WM_LBUTTONDOWN: 누른 자리 기억
                 PT c; GetCursorPos(out c);
                 pressed = true; dragging = false; startCursor = c.X; startX = CurrentX();
+                RC me; GetWindowRect(Handle, out me); GrabOffset = c.X - me.L;
                 SetCapture(Handle);
                 return;
             }
@@ -401,14 +442,14 @@ public class CiStripWindow : NativeWindow {
                 if (pressed) {
                     pressed = false; bool wasDrag = dragging; dragging = false;
                     ReleaseCapture();
-                    if (wasDrag) { DroppedX = CurrentX(); if (Dropped != null) Dropped(this, EventArgs.Empty); }
+                    if (wasDrag) { Drop(); }
                     else if (LeftClick != null) LeftClick(this, EventArgs.Empty);
                 }
                 return;
             case 0x0215:                                        // WM_CAPTURECHANGED: 끌다가 포커스를 잃으면 그 자리에 놓는다
                 if (pressed) {
                     pressed = false; bool wasDrag = dragging; dragging = false;
-                    if (wasDrag) { DroppedX = CurrentX(); if (Dropped != null) Dropped(this, EventArgs.Empty); }
+                    if (wasDrag) Drop();
                 }
                 break;
             case 0x0205:                                        // WM_RBUTTONUP
@@ -420,21 +461,62 @@ public class CiStripWindow : NativeWindow {
 }
 "@
 $StripW = 118; $StripH = 40
-$stripPosFile = Join-Path $env:LOCALAPPDATA 'ci-widget.strip'   # 옮긴 막대의 x(작업표시줄 안 좌표)
+$stripPosFile = Join-Path $env:LOCALAPPDATA 'ci-widget.strip'   # 옮긴 막대 자리 "화면장치|x"(x는 작업표시줄 안 좌표, 비면 기본 자리)
+$script:stripDevice = $null
+# 작업표시줄 목록: 주(Shell_TrayWnd)와 다른 화면의 보조(Shell_SecondaryTrayWnd). 화면 장치 이름으로 구분한다
+function Get-Taskbars {
+    $N = [CiWidget.Native]
+    foreach ($cls in 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd') {
+        $h = [IntPtr]::Zero
+        while (($h = $N::FindWindowEx([IntPtr]::Zero, $h, $cls, $null)) -ne [IntPtr]::Zero) {
+            $r = New-Object CiWidget.Native+RECT; [void]$N::GetWindowRect($h, [ref]$r)
+            [pscustomobject]@{ Handle = $h; Rect = $r; Primary = ($cls -eq 'Shell_TrayWnd'); Device = [Windows.Forms.Screen]::FromHandle($h).DeviceName }
+        }
+    }
+}
+function Read-StripPos {
+    $pos = @{ Device = $null; X = $null }
+    if (-not (Test-Path $stripPosFile)) { return $pos }
+    $parts = (Get-Content $stripPosFile -Raw).Trim() -split '\|'
+    $v = 0
+    if ($parts.Count -ge 2) { $pos.Device = $parts[0]; if ([int]::TryParse($parts[1], [ref]$v)) { $pos.X = $v } }
+    elseif ([int]::TryParse($parts[0], [ref]$v)) { $pos.X = $v }   # 예전 형식(x만): 주 작업표시줄
+    $pos
+}
+function Save-StripPos($device, $x) { try { [IO.File]::WriteAllText($stripPosFile, "$device|$x") } catch {} }
 $script:stripParent = [IntPtr]::Zero
 $script:stripBack = $T.bg
 $stripMenu = New-Object Windows.Forms.ContextMenuStrip
 [void]$stripMenu.Items.Add('창 열기/숨기기', $null, { Toggle-Main })
 [void]$stripMenu.Items.Add('새로고침', $null, { $script:tick = 0; Start-Fetch })
-[void]$stripMenu.Items.Add('막대 위치 초기화', $null, { Remove-Item $stripPosFile -ErrorAction SilentlyContinue; Attach-Strip })
+$moveMenu = New-Object Windows.Forms.ToolStripMenuItem('작업표시줄 옮기기')
+[void]$moveMenu.DropDownItems.Add('…')   # 열 때 채운다(빈 하위 메뉴는 화살표가 안 보인다)
+$moveMenu.add_DropDownOpening({
+    $moveMenu.DropDownItems.Clear()
+    foreach ($bar in @(Get-Taskbars)) {
+        $label = "$(if ($bar.Primary) { '주 화면' } else { '보조 화면' }) ($($bar.Device -replace '^\\\\\.\\', ''))"
+        $item = $moveMenu.DropDownItems.Add($label)
+        $item.Tag = $bar.Device
+        $item.Checked = ($bar.Device -eq $script:stripDevice)
+        $item.add_Click({ param($s, $e) Save-StripPos $s.Tag ''; [void]$form.BeginInvoke([Action]{ Attach-Strip }) })
+    }
+})
+[void]$stripMenu.Items.Add($moveMenu)
+[void]$stripMenu.Items.Add('막대 위치 초기화', $null, { Remove-Item $stripPosFile -ErrorAction SilentlyContinue; [void]$form.BeginInvoke([Action]{ Attach-Strip }) })
 [void]$stripMenu.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
 [void]$stripMenu.Items.Add('종료', $null, { Exit-App })
 function New-StripWindow {
     $w = New-Object CiStripWindow
     $w.add_LeftClick({ Toggle-Main })
     $w.add_Dropped({
-        try { [IO.File]::WriteAllText($stripPosFile, [string]$script:sw.DroppedX) } catch {}
-        Attach-Strip
+        # 커서를 다른 화면에 놓았으면 그 화면의 작업표시줄로 옮긴다(작업표시줄 위가 아니어도 그 화면이면 된다)
+        $pt = New-Object Drawing.Point($script:sw.DropScreenX, $script:sw.DropScreenY)
+        $dev = [Windows.Forms.Screen]::FromPoint($pt).DeviceName
+        $target = @(Get-Taskbars) | Where-Object Device -eq $dev | Select-Object -First 1
+        if ($target -and $target.Handle -ne $script:stripParent) { Save-StripPos $dev ($pt.X - $target.Rect.Left - $script:sw.GrabOffset) }
+        else { Save-StripPos $script:stripDevice $script:sw.DroppedX }
+        # 막대 창의 메시지 처리 도중에 그 창을 지우면 안 되므로 메시지 큐 뒤로 미룬다
+        [void]$form.BeginInvoke([Action]{ Attach-Strip })
     })
     $w.add_RightClick({
         $stripMenu.Show([Windows.Forms.Cursor]::Position)
@@ -512,15 +594,20 @@ function Resolve-StripX([int]$x, [int[]]$spans, [int]$minX, [int]$maxX) {
 
 function Attach-Strip {
     $N = [CiWidget.Native]
-    $tb = $N::FindWindow('Shell_TrayWnd', $null)
-    if ($tb -eq [IntPtr]::Zero) { return }
-    $rb = New-Object CiWidget.Native+RECT; [void]$N::GetWindowRect($tb, [ref]$rb)
-    $right = $rb.Right
+    $bars = @(Get-Taskbars)
+    $pos = Read-StripPos
+    $bar = $bars | Where-Object { $pos.Device -and $_.Device -eq $pos.Device } | Select-Object -First 1
+    # 저장한 화면이 없으면(모니터를 뺐을 때 등) 저장값은 그대로 두고 주 작업표시줄에 둔다
+    $useSaved = [bool]$bar -or (-not $pos.Device)
+    if (-not $bar) { $bar = $bars | Where-Object Primary | Select-Object -First 1 }
+    if (-not $bar) { return }
+    $tb = $bar.Handle; $rb = $bar.Rect
+    $script:stripDevice = $bar.Device
+    $right = $rb.Right - 100   # 보조 작업표시줄은 알림 영역 창이 없고 오른쪽 끝에 시계만 있다
     $tray = $N::FindWindowEx($tb, [IntPtr]::Zero, 'TrayNotifyWnd', $null)
     if ($tray -ne [IntPtr]::Zero) { $rt = New-Object CiWidget.Native+RECT; [void]$N::GetWindowRect($tray, [ref]$rt); $right = $rt.Left }
     $minX = 4; $maxX = $right - $rb.Left - $StripW - 8
-    $x = $maxX
-    if (Test-Path $stripPosFile) { $saved = 0; if ([int]::TryParse((Get-Content $stripPosFile -Raw).Trim(), [ref]$saved)) { $x = $saved } }
+    $x = if ($useSaved -and $null -ne $pos.X) { $pos.X } else { $maxX }
     $x = [Math]::Max($minX, [Math]::Min($maxX, $x))
     $self = if ($script:sw) { $script:sw.Handle } else { [IntPtr]::Zero }
     $x = Resolve-StripX $x ([CiStripWindow]::SiblingSpans($tb, $self)) $minX $maxX
@@ -625,6 +712,16 @@ $miniBar.Add_MouseDown({
     [void][CiWidget.Native]::SendMessage($form.Handle, 0xA1, [IntPtr]2, [IntPtr]::Zero)   # WM_NCLBUTTONDOWN, HTCAPTION
 })
 $head.Add_Resize({ Place-Head; $head.Invalidate() })
+$head.Add_MouseClick({
+    param($s, $e)
+    $hit = $script:chipRects | Where-Object { $_.rect.Contains($e.Location) } | Select-Object -First 1
+    if ($hit) { Set-Filter $hit.key }
+})
+$head.Add_MouseMove({
+    param($s, $e)
+    $over = [bool]($script:chipRects | Where-Object { $_.rect.Contains($e.Location) })
+    $head.Cursor = if ($over) { [Windows.Forms.Cursors]::Hand } else { [Windows.Forms.Cursors]::Default }
+})
 # '내용' 칸이 남는 폭을 채워 머리글 오른쪽에 빈 칸(흰 띠)이 생기지 않게 한다
 function Fit-Columns {
     $other = 0; foreach ($i in 0, 1, 3, 4, 5) { $other += $list.Columns[$i].Width }
@@ -668,6 +765,7 @@ $timer.Add_Tick({
 })
 # 처음 보일 때(숨긴 채 시작했으면 처음 열 때) 지난 모드를 적용한다
 $form.Add_Shown({ if ($startMini) { Set-Mini $true } })
+[void]$form.Handle   # 숨긴 채 시작해도 $form.BeginInvoke를 쓸 수 있게 창 핸들을 먼저 만든다
 try { Attach-Strip } catch { $script:note = "작업표시줄: $($_.Exception.Message)"; $_ | Out-File (Join-Path $env:TEMP 'ci-widget-strip.err') }
 Start-Fetch; $timer.Start()
 # 창을 숨겨도 계속 돌도록 창 없는 메시지 루프로 돌린다(종료는 Exit-App)
