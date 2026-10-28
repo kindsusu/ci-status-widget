@@ -1,0 +1,5 @@
+{
+  "org": "your-org",
+  "repos": ["repo-a", "repo-b"],
+  "refreshSeconds": 180
+}
