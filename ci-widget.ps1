@@ -371,9 +371,11 @@ public class CiStripWindow : NativeWindow {
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumProc f, IntPtr l);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
 
-    public event EventHandler LeftClick, RightClick, Dropped;
+    public event EventHandler LeftClick, RightClick, Dropped, DragStarted;
     public int MinX, MaxX, Y;          // 끌 수 있는 범위(작업표시줄 안 좌표)
-    public int DroppedX, DropScreenX, DropScreenY, GrabOffset;   // 놓은 자리(작업표시줄 안 x), 놓을 때 커서(화면), 막대 왼쪽에서 잡은 위치
+    public int DroppedX, DropScreenX, DropScreenY, GrabOffset, GrabY;   // 놓은 자리(작업표시줄 안 x), 놓을 때 커서(화면), 막대 안에서 잡은 위치
+    public IntPtr GhostHandle;      // 끄는 동안 커서를 따라다니는 반투명 막대(PowerShell 쪽에서 만들어 넣는다)
+    int startCursorY;
     bool pressed, dragging;
     int startCursor, startX;
 
@@ -417,25 +419,25 @@ public class CiStripWindow : NativeWindow {
     protected override void WndProc(ref Message m) {
         switch (m.Msg) {
             case 0x0021: m.Result = new IntPtr(3); return;     // WM_MOUSEACTIVATE → MA_NOACTIVATE
-            case 0x0020:                                        // WM_SETCURSOR: 평소 손, 끄는 중 좌우 화살표
-                SetCursor(LoadCursor(IntPtr.Zero, dragging ? 32644 : 32649)); m.Result = new IntPtr(1); return;
+            case 0x0020:                                        // WM_SETCURSOR: 평소 손, 끄는 중 보통 화살표
+                SetCursor(LoadCursor(IntPtr.Zero, dragging ? 32512 : 32649)); m.Result = new IntPtr(1); return;
             case 0x0201: {                                      // WM_LBUTTONDOWN: 누른 자리 기억
                 PT c; GetCursorPos(out c);
                 pressed = true; dragging = false; startCursor = c.X; startX = CurrentX();
-                RC me; GetWindowRect(Handle, out me); GrabOffset = c.X - me.L;
+                RC me; GetWindowRect(Handle, out me); GrabOffset = c.X - me.L; GrabY = c.Y - me.T; startCursorY = c.Y;
                 SetCapture(Handle);
                 return;
             }
-            case 0x0200:                                        // WM_MOUSEMOVE: 4px 넘게 움직이면 끌기
+            case 0x0200:                                        // WM_MOUSEMOVE: 4px 넘게 움직이면 끌기. 원래 막대는 제자리, 고스트가 커서를 따라간다
                 if (pressed) {
                     PT c; GetCursorPos(out c);
-                    int dx = c.X - startCursor;
-                    if (!dragging && Math.Abs(dx) >= 4) dragging = true;
-                    if (dragging) {
-                        int nx = Math.Max(MinX, Math.Min(MaxX, startX + dx));
-                        SetWindowPos(Handle, IntPtr.Zero, nx, Y, 0, 0, 0x0001 | 0x0004 | 0x0010);   // NOSIZE|NOZORDER|NOACTIVATE
-                        SetCursor(LoadCursor(IntPtr.Zero, 32644));
+                    if (!dragging && Math.Max(Math.Abs(c.X - startCursor), Math.Abs(c.Y - startCursorY)) >= 4) {
+                        dragging = true;
+                        SetCursor(LoadCursor(IntPtr.Zero, 32512));
+                        if (DragStarted != null) DragStarted(this, EventArgs.Empty);
                     }
+                    if (dragging && GhostHandle != IntPtr.Zero)
+                        SetWindowPos(GhostHandle, new IntPtr(-1), c.X - GrabOffset, c.Y - GrabY, 0, 0, 0x0001 | 0x0010);   // HWND_TOPMOST, NOSIZE|NOACTIVATE
                 }
                 break;
             case 0x0202:                                        // WM_LBUTTONUP: 끌었으면 놓기, 아니면 클릭
@@ -457,6 +459,19 @@ public class CiStripWindow : NativeWindow {
                 break;
         }
         base.WndProc(ref m);
+    }
+}
+// 끄는 동안 커서를 따라다니는 반투명 막대: 최상위·클릭 통과 계층 창(모든 화면으로 따라간다)
+public class CiGhostWindow : NativeWindow {
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+    public CiGhostWindow() {
+        var cp = new CreateParams();
+        cp.Caption = "CI status strip ghost";
+        cp.Style = unchecked((int)0x80000000);                                      // WS_POPUP, 아직 숨김
+        cp.ExStyle = 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000 | 0x00000008;  // LAYERED|TRANSPARENT|TOOLWINDOW|NOACTIVATE|TOPMOST
+        cp.Width = 1; cp.Height = 1;
+        IntPtr old = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try { CreateHandle(cp); } finally { SetThreadDpiAwarenessContext(old); }
     }
 }
 "@
@@ -508,13 +523,15 @@ $moveMenu.add_DropDownOpening({
 function New-StripWindow {
     $w = New-Object CiStripWindow
     $w.add_LeftClick({ Toggle-Main })
+    $w.add_DragStarted({ Start-Ghost })
     $w.add_Dropped({
-        # 커서를 다른 화면에 놓았으면 그 화면의 작업표시줄로 옮긴다(작업표시줄 위가 아니어도 그 화면이면 된다)
+        End-Ghost
+        # 고스트를 놓은 화면의 작업표시줄, 고스트가 있던 가로 위치로 옮긴다(작업표시줄 위가 아니어도 그 화면이면 된다)
         $pt = New-Object Drawing.Point($script:sw.DropScreenX, $script:sw.DropScreenY)
         $dev = [Windows.Forms.Screen]::FromPoint($pt).DeviceName
         $target = @(Get-Taskbars) | Where-Object Device -eq $dev | Select-Object -First 1
-        if ($target -and $target.Handle -ne $script:stripParent) { Save-StripPos $dev ($pt.X - $target.Rect.Left - $script:sw.GrabOffset) }
-        else { Save-StripPos $script:stripDevice $script:sw.DroppedX }
+        if (-not $target) { $target = @(Get-Taskbars) | Where-Object Handle -eq $script:stripParent | Select-Object -First 1 }
+        if ($target) { Save-StripPos $target.Device ($pt.X - $target.Rect.Left - $script:sw.GrabOffset) }
         # 막대 창의 메시지 처리 도중에 그 창을 지우면 안 되므로 메시지 큐 뒤로 미룬다
         [void]$form.BeginInvoke([Action]{ Attach-Strip })
     })
@@ -529,35 +546,64 @@ $script:sw = $null
 
 # 바탕은 거의 투명(알파 1)해서 작업표시줄이 비쳐 보이고, 클릭은 그대로 받는다.
 # 글자는 GDI+로 그린다. GDI(TextRenderer)는 32비트 비트맵의 알파를 0으로 지워 글자가 뚫린다.
-function Draw-Strip([Drawing.Graphics]$g, [int]$w, [int]$h) {
+# -Solid: 고스트용. 작업표시줄 색 바탕을 깔아 어디 위에 있어도 읽히게 한다
+function Draw-Strip([Drawing.Graphics]$g, [int]$w, [int]$h, [switch]$Solid) {
     $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'AntiAliasGridFit'
     $g.Clear([Drawing.Color]::FromArgb(1, 0, 0, 0))
-    # 작업표시줄이 밝은 테마면 글자·점 색을 어둡게 바꿔 대비를 지킨다
+    if ($Solid) {
+        $path = New-Object Drawing.Drawing2D.GraphicsPath
+        $path.AddArc(0, 0, 12, 12, 180, 90); $path.AddArc(($w - 13), 0, 12, 12, 270, 90)
+        $path.AddArc(($w - 13), ($h - 13), 12, 12, 0, 90); $path.AddArc(0, ($h - 13), 12, 12, 90, 90); $path.CloseFigure()
+        $b = New-Object Drawing.SolidBrush([Drawing.Color]::FromArgb(255, $script:stripBack)); $g.FillPath($b, $path); $b.Dispose()
+        $pen = New-Object Drawing.Pen((C '#94A3B8')); $g.DrawPath($pen, $path); $pen.Dispose(); $path.Dispose()
+    }
+    # 작업표시줄이 밝은 테마면 글자색을 어둡게 바꿔 대비를 지킨다
     $light = $script:stripBack.GetBrightness() -gt 0.5
     $fg = if ($light) { C '#0F172A' } else { $T.fg }
-    $dim = if ($light) { C '#475569' } else { $T.muted }
-    # 작업표시줄 막대에서는 실행 중을 초록으로 보여 준다(사용자 요청). 밝은 작업표시줄은 대비를 위해 진한 초록
-    $tones = if ($light) { @{ running = C '#15803D'; queued = C '#B45309' } } else { @{ running = $T.success; queued = $T.queued } }
+    $dim = if ($light) { C '#64748B' } else { $T.muted }
+    # 0건 점은 옅은 회색(진한 회색은 작은 점에서 검게 보였다)
+    $zero = if ($light) { C '#A3ACB9' } else { C '#64748B' }
+    # 실행 중은 밝은 초록(사용자 요청). 진한 초록(#15803D)은 8px 점에서 검게 보였다
+    $tones = if ($light) { @{ running = C '#16A34A'; queued = C '#D97706' } } else { @{ running = $T.success; queued = $T.queued } }
     $sf = New-Object Drawing.StringFormat -Property @{ LineAlignment = 'Center'; FormatFlags = 'NoWrap' }
     $b = New-Object Drawing.SolidBrush($dim); $g.DrawString('CI', $fontStripTitle, $b, (New-Object Drawing.RectangleF(2, 0, 30, $h)), $sf); $b.Dispose()
     $y = [int](($h - 36) / 2)
     foreach ($chip in @(('running', '실행 중', $false), ('queued', '대기', $true))) {
         $n = $script:summary[$chip[0]]
-        $tone = if ($n) { $tones[$chip[0]] } else { $dim }
-        if ($chip[2]) { $pen = New-Object Drawing.Pen($tone, 1.6); $g.DrawEllipse($pen, 33, ($y + 5), 8, 8); $pen.Dispose() }
-        else { $b = New-Object Drawing.SolidBrush($tone); $g.FillEllipse($b, 33, ($y + 5), 8, 8); $b.Dispose() }
+        $tone = if ($n) { $tones[$chip[0]] } else { $zero }
+        if ($chip[2]) { $pen = New-Object Drawing.Pen($tone, 1.8); $g.DrawEllipse($pen, 33, ($y + 4), 9, 9); $pen.Dispose() }
+        else { $b = New-Object Drawing.SolidBrush($tone); $g.FillEllipse($b, 33, ($y + 4), 10, 10); $b.Dispose() }
         $b = New-Object Drawing.SolidBrush($(if ($n) { $fg } else { $dim }))
         $g.DrawString("$($chip[1]) $n", $fontStrip, $b, (New-Object Drawing.RectangleF(45, $y, ($w - 46), 18)), $sf); $b.Dispose()
         $y += 18
     }
     $sf.Dispose()
 }
+$script:stripAlpha = 255   # 끄는 동안 원래 막대는 흐리게(90)
+$script:ghost = $null
 function Update-Strip {
     if (-not $script:sw -or $script:stripParent -eq [IntPtr]::Zero) { return }
+    Publish-Strip $script:sw.Handle $script:stripAlpha
+}
+function Start-Ghost {
+    End-Ghost
+    $script:ghost = New-Object CiGhostWindow
+    Publish-Strip $script:ghost.Handle 153 -Solid   # 60% 반투명
+    $c = [Windows.Forms.Cursor]::Position
+    [void][CiWidget.Native]::SetWindowPos($script:ghost.Handle, [IntPtr](-1), ($c.X - $script:sw.GrabOffset), ($c.Y - $script:sw.GrabY), $StripW, $StripH, 0x0010 -bor 0x0040)   # TOPMOST, NOACTIVATE|SHOWWINDOW
+    $script:sw.GhostHandle = $script:ghost.Handle
+    $script:stripAlpha = 90; Update-Strip
+}
+function End-Ghost {
+    if ($script:sw) { $script:sw.GhostHandle = [IntPtr]::Zero }
+    if ($script:ghost) { $script:ghost.DestroyHandle(); $script:ghost = $null }
+    $script:stripAlpha = 255
+}
+function Publish-Strip([IntPtr]$hwnd, [int]$alpha, [switch]$Solid) {
     $N = [CiWidget.Native]
     $w = $StripW; $h = $StripH
     $bmp = New-Object Drawing.Bitmap($w, $h, [Drawing.Imaging.PixelFormat]::Format32bppPArgb)
-    $g = [Drawing.Graphics]::FromImage($bmp); Draw-Strip $g $w $h; $g.Dispose()
+    $g = [Drawing.Graphics]::FromImage($bmp); Draw-Strip $g $w $h -Solid:$Solid; $g.Dispose()
     $screen = $N::GetDC([IntPtr]::Zero); $mem = $N::CreateCompatibleDC($screen)
     # GDI+ GetHbitmap은 알파를 잃는다. 미리 곱한(PArgb) 픽셀을 32비트 DIB에 그대로 옮긴다
     $bi = New-Object CiWidget.Native+BITMAPINFOHEADER -Property @{ biSize = 40; biWidth = $w; biHeight = -$h; biPlanes = 1; biBitCount = 32 }
@@ -571,8 +617,8 @@ function Update-Strip {
     $old = $N::SelectObject($mem, $hbmp)
     $size = New-Object CiWidget.Native+SIZE -Property @{ cx = $w; cy = $h }
     $src = New-Object CiWidget.Native+POINT
-    $blend = New-Object CiWidget.Native+BLENDFUNCTION -Property @{ SourceConstantAlpha = 255; AlphaFormat = 1 }   # AC_SRC_ALPHA
-    [void]$N::UpdateLayeredWindow($script:sw.Handle, $screen, [IntPtr]::Zero, [ref]$size, $mem, [ref]$src, 0, [ref]$blend, 2)   # ULW_ALPHA
+    $blend = New-Object CiWidget.Native+BLENDFUNCTION -Property @{ SourceConstantAlpha = [byte]$alpha; AlphaFormat = 1 }   # AC_SRC_ALPHA
+    [void]$N::UpdateLayeredWindow($hwnd, $screen, [IntPtr]::Zero, [ref]$size, $mem, [ref]$src, 0, [ref]$blend, 2)   # ULW_ALPHA
     [void]$N::SelectObject($mem, $old); [void]$N::DeleteObject($hbmp); [void]$N::DeleteDC($mem); [void]$N::ReleaseDC([IntPtr]::Zero, $screen)
     $bmp.Dispose()
 }
@@ -686,7 +732,7 @@ function Show-Main {
     Remove-Item $hiddenFile -ErrorAction SilentlyContinue
 }
 function Toggle-Main { if ($form.Visible -and $form.WindowState -ne 'Minimized') { Hide-Main } else { Show-Main } }
-function Exit-App { $script:exiting = $true; $timer.Stop(); if ($script:sw) { $script:sw.DestroyHandle() }; $form.Close(); [Windows.Forms.Application]::Exit() }
+function Exit-App { $script:exiting = $true; $timer.Stop(); End-Ghost; if ($script:sw) { $script:sw.DestroyHandle() }; $form.Close(); [Windows.Forms.Application]::Exit() }
 # 창의 X는 작업표시줄 막대로 숨기기만 한다(종료는 막대 오른쪽 클릭 메뉴)
 $form.Add_FormClosing({ param($s, $e) if (-not $script:exiting -and $e.CloseReason -eq 'UserClosing') { $e.Cancel = $true; Hide-Main } })
 function Open-Selected {
@@ -751,6 +797,8 @@ if ($Snapshot) {
     $sb = New-Object Drawing.Bitmap($StripW, $StripH)
     $sg = [Drawing.Graphics]::FromImage($sb); $sg.Clear($script:stripBack); Draw-Strip $sg $StripW $StripH; $sg.Dispose()
     $sb.Save(($Snapshot -replace '\.png$', '-strip.png'))
+    $gb = New-Object Drawing.Bitmap($StripW, $StripH); $gg = [Drawing.Graphics]::FromImage($gb); Draw-Strip $gg $StripW $StripH -Solid; $gg.Dispose()
+    $gb.Save(($Snapshot -replace '\.png$', '-ghost.png'))
     $script:exiting = $true; $form.Close(); exit
 }
 
