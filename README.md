@@ -12,7 +12,10 @@ GitHub Actions 실행 현황을 Windows 바탕화면 팝업과 작업표시줄�
 ## 필요한 것
 
 - Windows 10/11, Windows PowerShell 5.1(기본 설치)
-- [GitHub CLI](https://cli.github.com/) `gh`가 설치되어 있고 `gh auth login`으로 로그인된 상태. 위젯은 `gh run list`로만 조회합니다.
+- [GitHub CLI](https://cli.github.com/) `gh`와 GitHub 로그인. 위젯은 `gh run list`로만 조회합니다.
+  - **gh가 없으면** 위젯 창에 `gh 설치` 버튼이 나옵니다. 누르면 한 번 확인한 뒤 GitHub 공식 릴리스 zip을 받아 SHA-256을 확인하고 `%LOCALAPPDATA%\Programs\gh`에 풀고 사용자 PATH에 더합니다(관리자 권한 불필요, winget 없는 PC도 됨).
+  - **로그인이 안 되어 있으면** `로그인` 버튼이 나옵니다. `gh auth login --web` 창이 열리고, 브라우저에서 코드를 입력해 승인하면 됩니다. 로그인은 본인 승인이 필요해 자동으로 할 수 없습니다.
+  - 이 동안 작업표시줄 막대와 미니 모드는 `0 / 0` 대신 **확인 필요**로 보이고, 15초마다 다시 확인해 해결되면 바로 정상 화면으로 돌아옵니다.
 - PowerShell 실행 정책이 로컬 스크립트를 허용해야 합니다(`RemoteSigned` 등).
 
 ## 설치
