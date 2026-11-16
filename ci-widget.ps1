@@ -70,15 +70,18 @@ $fetch = {
     if (-not $gh) { $local = Join-Path $env:LOCALAPPDATA 'Programs\gh\bin\gh.exe'; if (Test-Path $local) { $gh = $local } }
     if (-not $gh) { [pscustomobject]@{ problem = 'nogh' }; return }
     foreach ($r in $Repos) {
-        $out = & $gh run list --repo "$Org/$r" --limit 10 --json name,displayTitle,headBranch,status,conclusion,createdAt,updatedAt,url 2>&1
+        # "owner/repo"로 적은 항목은 그 조직, 이름만 적으면 org의 저장소(여러 조직에 걸친 정본을 함께 본다)
+        $full = if ($r -like '*/*') { $r } else { "$Org/$r" }
+        $name = ($r -split '/')[-1]
+        $out = & $gh run list --repo $full --limit 10 --json name,displayTitle,headBranch,status,conclusion,createdAt,updatedAt,url 2>&1
         $err = ($out | Where-Object { $_ -is [Management.Automation.ErrorRecord] }) -join "`n"
         $json = ($out | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] }) -join "`n"
         if ($LASTEXITCODE) {
             if ($err -match 'gh auth login|GH_TOKEN|HTTP 401') { [pscustomobject]@{ problem = 'noauth' }; return }
-            [pscustomobject]@{ repo = $r; error = $true; message = ($err -split "`n")[0] }
+            [pscustomobject]@{ repo = $name; error = $true; message = ($err -split "`n")[0] }
             continue
         }
-        foreach ($x in (ConvertFrom-Json $json)) { $x | Add-Member repo $r -PassThru }
+        foreach ($x in (ConvertFrom-Json $json)) { $x | Add-Member repo $name -PassThru }
     }
 }
 

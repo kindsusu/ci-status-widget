@@ -26,10 +26,12 @@ GitHub Actions 실행 현황을 Windows 바탕화면 팝업과 작업표시줄�
    ```json
    {
      "org": "your-org",
-     "repos": ["repo-a", "repo-b"],
+     "repos": ["repo-a", "repo-b", "other-org/repo-c"],
      "refreshSeconds": 180
    }
    ```
+
+   이름만 적으면 `org`의 저장소이고, `owner/repo`로 적으면 다른 조직·계정의 저장소도 함께 봅니다.
 
 3. 바로가기를 만듭니다. `-Startup`을 붙이면 로그인할 때 자동으로 실행됩니다.
 

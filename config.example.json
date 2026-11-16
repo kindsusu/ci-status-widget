@@ -1,5 +1,5 @@
 {
   "org": "your-org",
-  "repos": ["repo-a", "repo-b"],
+  "repos": ["repo-a", "repo-b", "other-org/repo-c"],
   "refreshSeconds": 180
 }
